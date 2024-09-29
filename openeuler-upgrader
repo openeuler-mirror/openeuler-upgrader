@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# ANSI 转义码
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+LOG_FILE="/var/log/os-upgrade.log"
+DEBUG_LOG_FILE="/var/log/os-upgrade.debug.log"
+
+# 显示帮助信息
+function show_help() {
+    echo -e "${BLUE}用法: $0 [选项] [版本号]${NC}"
+    echo -e "${BLUE}选项：${NC}"
+    echo -e "  ${GREEN}--help, -h${NC}          显示此帮助信息"
+    echo -e "  ${GREEN}[版本号]${NC}            指定要升级到的版本（例如 24.03LTS），默认为 24.03LTS"
+    exit 0
+}
+
+# 设置日志
+function setup_logging() {
+    # 确保日志目录存在
+    mkdir -p "$(dirname "$LOG_FILE")"
+
+    # 重定向标准输出到日志文件，并同时显示在终端
+    exec > >(tee -a "$LOG_FILE")
+    exec 2>&1  # 将标准错误也重定向到标准输出
+
+    # 打开文件描述符 5 并指向调试日志文件
+    exec 5>"$DEBUG_LOG_FILE"
+    BASH_XTRACEFD=5
+
+    # 设置调试提示符格式
+    export PS4='+(${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+}
+
+# 辅助函数定义
+function print_info() {
+    echo -e "${BLUE}$1${NC}"
+}
+
+function print_success() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+function print_warning() {
+    echo -e "${YELLOW}$1${NC}"
+}
+
+function print_error() {
+    echo -e "${RED}$1${NC}"
+}
+
+function check_root_privileges() {
+    if [ "$EUID" -ne 0 ]; then
+        print_error "请以root用户身份运行此脚本"
+        exit 1
+    fi
+}
+
+function backup_and_modify_repos() {
+    # 创建备份目录
+    backup_dir="/etc/yum.repos.d/backup-$(date +%Y%m%d)"
+    mkdir -p "$backup_dir"
+
+    # 备份现有的仓库配置文件（除了 openEuler.repo）
+    mv /etc/yum.repos.d/*.repo "$backup_dir"
+    cp "$backup_dir/openEuler.repo" /etc/yum.repos.d/
+
+    # 修改 openEuler.repo 文件，注释掉 baseurl 行
+    sed -i 's/baseurl/# baseurl/g' /etc/yum.repos.d/openEuler.repo
+
+    print_success "Repo files backed up to $backup_dir and openEuler.repo modified"
+}
+
+function update_system() {
+    local releasever="${1:-24.03LTS}"  # 如果没有传入参数，则使用默认值 24.03LTS
+    # 更新软件包列表
+    dnf clean all >> ${LOG_FILE} 2>&1
+    dnf makecache >> ${LOG_FILE} 2>&1
+    if ! dnf distro-sync -y --releasever="$releasever" >> ${LOG_FILE} 2>&1; then
+        print_error "更新软件包列表失败，请检查网络连接或稍后重试。"
+        exit 1
+    fi
+    print_success "System updated to $releasever LTS"
+}
+
+function prompt_reboot() {
+    print_warning "系统升级完成，请重启计算机以应用所有更改。"
+}
+
+function check_network_connection() {
+    if ! ping -c 1 mirrors.openeuler.org &> /dev/null; then
+        print_error "网络连接不可用，请检查网络连接后重试。"
+        exit 1
+    fi
+}
+
+function check_disk_space() {
+    min_free_space=5000000 # 5GB in KB
+    free_space=$(df -k / | awk 'NR==2{print $4}')
+    if [ "$free_space" -lt "$min_free_space" ]; then
+        print_error "磁盘空间不足，请清理空间后重试。"
+        exit 1
+    fi
+}
+
+# 主程序
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    show_help
+fi
+
+setup_logging  # 设置日志
+set -x  # 开启调试模式
+
+print_info "升级前检查..."
+
+check_root_privileges
+# check_network_connection
+check_disk_space
+
+print_info "开始升级过程..."
+
+# 备份和修改仓库
+print_info "备份和修改仓库..."
+backup_and_modify_repos
+
+# 更新系统
+print_info "更新系统..."
+update_system "$1"  # 传递命令行参数到 update_system 函数
+
+# 提示重启
+prompt_reboot
+
+set +x  # 关闭调试模式
